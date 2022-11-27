@@ -44,6 +44,8 @@ spec:
                       type: string
                     repository:
                       type: string
+                    version:
+                      type: string
                   required:
                   - kind
                   - name
@@ -71,16 +73,22 @@ spec:
                       type: array
                     name:
                       type: string
-                    namespace:
-                      type: string
+                    placement:
+                      properties:
+                        staticPlacement:
+                          properties:
+                            namespace:
+                              type: string
+                          required:
+                          - namespace
+                          type: object
+                      type: object
                     requiredArtifacts:
                       items:
                         type: string
                       type: array
                   required:
-                  - constraints
                   - name
-                  - namespace
                   - requiredArtifacts
                   type: object
                 type: array
@@ -162,6 +170,13 @@ spec:
                   - type
                   type: object
                 type: array
+              controllerWorkflowID:
+                type: string
+              controllerWorkflowRunID:
+                type: string
+            required:
+            - controllerWorkflowID
+            - controllerWorkflowRunID
             type: object
         type: object
     served: true

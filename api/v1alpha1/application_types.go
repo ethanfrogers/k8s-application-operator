@@ -27,6 +27,7 @@ type Artifact struct {
 	Name       string `json:"name"`
 	Kind       string `json:"kind"`
 	Repository string `json:"repository"`
+	Version    string `json:"version,omitempty"`
 }
 type Constraint struct {
 	Kind string `json:"kind"`
@@ -38,11 +39,19 @@ type DependsOnConstraint struct {
 	EnvironmentName string `json:"environment"`
 }
 
+type StaticPlacement struct {
+	Namespace string `json:"namespace"`
+}
+
+type Placement struct {
+	StaticPlacement *StaticPlacement `json:"staticPlacement,omitempty"`
+}
+
 type Environment struct {
 	Name              string       `json:"name"`
-	Namespace         string       `json:"namespace"`
 	RequiredArtifacts []string     `json:"requiredArtifacts"`
-	Constraints       []Constraint `json:"constraints"`
+	Constraints       []Constraint `json:"constraints,omitempty"`
+	Placement         *Placement   `json:"placement,omitempty"`
 }
 
 // ApplicationSpec defines the desired state of Application
@@ -58,7 +67,9 @@ type ApplicationSpec struct {
 type ApplicationStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
+	Conditions              []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
+	ControllerWorkflowID    string             `json:"controllerWorkflowID"`
+	ControllerWorkflowRunID string             `json:"controllerWorkflowRunID"`
 }
 
 //+kubebuilder:object:root=true
