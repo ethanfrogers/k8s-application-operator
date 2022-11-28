@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+
 	"github.com/ethanfrogers/k8s-application-operator/pkg/worker"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -73,7 +74,7 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if controllerutil.ContainsFinalizer(&obj, applicationFinalizer) {
 			status := obj.Status
 			if err := r.TemporalClient.TerminateWorkflow(ctx, status.ControllerWorkflowID, status.ControllerWorkflowRunID, "object deletion"); err != nil {
-				return ctrl.Result{}, err
+				reqLogger.Error(err, "unable to terminate workflow")
 			}
 			controllerutil.RemoveFinalizer(&obj, applicationFinalizer)
 			if err := r.Update(ctx, &obj); err != nil {
@@ -128,7 +129,7 @@ func (r *ApplicationReconciler) startReconcilerWorkflow(ctx context.Context, key
 		ID:        fmt.Sprintf("reconcile-%s", key.String()),
 		TaskQueue: "application-reconciler",
 	}
-	req := worker.ReconcileRequest{Key: key.String()}
+	req := worker.ReconcileRequest{Name: key.Name, Namespace: key.Namespace}
 	execution, err := r.TemporalClient.ExecuteWorkflow(ctx, opts, "Reconcile", req)
 	if err != nil {
 		return nil, err

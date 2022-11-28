@@ -7,7 +7,7 @@ spec:
   artifacts:
     - kind: HelmChart
       name: chart
-      reference: https://charts.bitnami.com/bitnami/nginx
+      repository: https://charts.bitnami.com/bitnami/nginx
       version: 13.2.14
   environments:
     - name: staging

@@ -6,17 +6,27 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/ethanfrogers/k8s-application-operator/pkg/apis/application"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	deploymentsv1alpha1 "github.com/ethanfrogers/k8s-application-operator/api/v1alpha1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"github.com/ethanfrogers/k8s-application-operator/pkg/worker"
-	"go.temporal.io/sdk/client"
+	tclient "go.temporal.io/sdk/client"
 	temporal "go.temporal.io/sdk/worker"
 	"go.uber.org/zap"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 func main() {
-	workflowTaskQueue := flag.String("workflow-task-queue", "kubernetes_worker", "")
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(deploymentsv1alpha1.AddToScheme(scheme))
+
+	workflowTaskQueue := flag.String("workflow-task-queue", "application-reconciler", "")
 	temporalHost := flag.String("temporal-host", "localhost:7233", "")
 	kubeconfig := flag.String("kubeconfig", "", "")
 	flag.Parse()
@@ -26,11 +36,11 @@ func main() {
 		panic(err)
 	}
 
-	opts := client.Options{
+	opts := tclient.Options{
 		HostPort: *temporalHost,
 	}
 
-	c, err := client.Dial(opts)
+	c, err := tclient.Dial(opts)
 	if err != nil {
 		panic(err)
 	}
@@ -45,18 +55,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	applicationsClient, err := application.NewForConfig(config)
+	crclient, err := client.New(config, client.Options{Scheme: scheme})
 	if err != nil {
 		panic(err)
 	}
-	k8sClient, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err)
-	}
-
 	w := &worker.Worker{
-		ApplicationsClient: applicationsClient,
-		K8sClient:          k8sClient,
+		Client: crclient,
 	}
 
 	tworker := temporal.New(c, *workflowTaskQueue, temporal.Options{})
