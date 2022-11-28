@@ -4,22 +4,32 @@ import (
 	"context"
 	"fmt"
 	"github.com/ethanfrogers/k8s-application-operator/api/v1alpha1"
+	"github.com/ethanfrogers/k8s-application-operator/pkg/apis/application"
 	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 	"io"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
+	v12 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"net/http"
 	"os"
 	"os/exec"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"strings"
 	"time"
 )
 
 type Worker struct {
-	Client client.Client
+	ApplicationsClient *application.Clientset
+	K8sClient          *kubernetes.Clientset
+}
+
+func (w *Worker) Register(registry worker.Worker) {
+	registry.RegisterWorkflow(w.Reconcile)
+	registry.RegisterActivity(w.GetApplicationConfig)
+	registry.RegisterWorkflow(w.ManageEnvironment)
+	registry.RegisterActivity(w.InstallApplication)
+	registry.RegisterActivity(w.EnsureInstallation)
 }
 
 type ReconcileRequest struct {
@@ -62,12 +72,12 @@ func (w *Worker) Reconcile(ctx workflow.Context, req ReconcileRequest) error {
 }
 
 func (w *Worker) GetApplicationConfig(ctx context.Context, key string) (*v1alpha1.Application, error) {
-	var application v1alpha1.Application
 	parts := strings.Split(key, "/")
-	if err := w.Client.Get(ctx, types.NamespacedName{Namespace: parts[0], Name: parts[1]}, &application); err != nil {
+	application, err := w.ApplicationsClient.V1alpha1().Applications(parts[0]).Get(ctx, parts[1], v12.GetOptions{})
+	if err != nil {
 		return nil, err
 	}
-	return &application, nil
+	return application, nil
 }
 
 type InstallApplicationRequest struct {
@@ -84,10 +94,11 @@ func (w *Worker) InstallApplication(ctx context.Context, req *InstallApplication
 	if err != nil {
 		return nil, err
 	}
-	chartPath, err := downloadChartArtifact(ctx, chartArtifact.Repository)
+	chartPath, cleanup, err := downloadChartArtifact(ctx, chartArtifact.Repository, chartArtifact.Version)
 	if err != nil {
 		return nil, err
 	}
+	defer cleanup()
 	installName := req.Name
 	installNamespace := req.Namespace
 
@@ -116,21 +127,25 @@ func findFirstArtifact(artifacts []v1alpha1.Artifact, kind string) (*v1alpha1.Ar
 	return nil, fmt.Errorf("artifact of kind %s not found", kind)
 }
 
-func downloadChartArtifact(ctx context.Context, reference string) (string, error) {
-	resp, err := http.Get(reference)
+func downloadChartArtifact(ctx context.Context, reference, version string) (string, func(), error) {
+	url := fmt.Sprintf("%s-%s.tgz", reference, version)
+	resp, err := http.Get(url)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	f, err := os.CreateTemp("", "")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer f.Close()
 	if _, err := io.Copy(f, resp.Body); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	return f.Name(), nil
+	cleanup := func() {
+		os.RemoveAll(f.Name())
+	}
+	return f.Name(), cleanup, nil
 }
 
 type ManageEnvironmentRequest struct {
@@ -188,15 +203,14 @@ type EnsureInstallationRequest struct {
 }
 
 func (w *Worker) EnsureInstallation(ctx context.Context, req EnsureInstallationRequest) (bool, error) {
-	listOptions := []client.ListOption{
-		client.InNamespace(req.Namespace),
-		client.MatchingLabels{"owner": "helm", "name": req.Name},
+	listOptions := v12.ListOptions{
+		LabelSelector: fmt.Sprintf("owner=helm,name=%s", req.Name),
 	}
-	var configs v1.ConfigMapList
-	if err := w.Client.List(ctx, &configs, listOptions...); err != nil {
+	configMaps, err := w.K8sClient.CoreV1().ConfigMaps(req.Namespace).List(ctx, listOptions)
+	if err != nil {
 		return false, err
 	}
-	if len(configs.Items) == 0 {
+	if len(configMaps.Items) == 0 {
 		return false, nil
 	}
 	return true, nil

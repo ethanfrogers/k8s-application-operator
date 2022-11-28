@@ -3,12 +3,16 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/ethanfrogers/k8s-application-operator/pkg/apis/application"
 	"github.com/ethanfrogers/k8s-application-operator/pkg/worker"
 	"go.temporal.io/sdk/client"
 	temporal "go.temporal.io/sdk/worker"
 	"go.uber.org/zap"
-	"os"
-	"path/filepath"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 func main() {
@@ -26,7 +30,7 @@ func main() {
 		HostPort: *temporalHost,
 	}
 
-	c, err := client.NewLazyClient(opts)
+	c, err := client.Dial(opts)
 	if err != nil {
 		panic(err)
 	}
@@ -37,10 +41,28 @@ func main() {
 		kubeconfig = &pth
 		logger.Sugar().Infof("kubeconfig is empty, using default %s", *kubeconfig)
 	}
+	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	if err != nil {
+		panic(err)
+	}
+	applicationsClient, err := application.NewForConfig(config)
+	if err != nil {
+		panic(err)
+	}
+	k8sClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err)
+	}
 
-	w := &worker.Worker{}
+	w := &worker.Worker{
+		ApplicationsClient: applicationsClient,
+		K8sClient:          k8sClient,
+	}
 
-	if err := w.Run(temporal.InterruptCh()); err != nil {
+	tworker := temporal.New(c, *workflowTaskQueue, temporal.Options{})
+	w.Register(tworker)
+
+	if err := tworker.Run(temporal.InterruptCh()); err != nil {
 		fmt.Printf("worker failed to start: %s", err.Error())
 		os.Exit(1)
 	}
