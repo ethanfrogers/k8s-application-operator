@@ -8,7 +8,7 @@ spec:
     - kind: HelmChart
       name: chart
       repository: https://charts.bitnami.com/bitnami/nginx
-      version: 13.2.14
+      version: 13.2.13
   environments:
     - name: staging
       placement:

@@ -6,6 +6,10 @@ import (
 	"os"
 	"path/filepath"
 
+	"k8s.io/utils/pointer"
+
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+
 	"k8s.io/apimachinery/pkg/runtime"
 
 	deploymentsv1alpha1 "github.com/ethanfrogers/k8s-application-operator/api/v1alpha1"
@@ -59,8 +63,16 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
 	w := &worker.Worker{
 		Client: crclient,
+		RestClientGetterFactory: func(namespace string) (genericclioptions.RESTClientGetter, error) {
+			return &genericclioptions.ConfigFlags{
+				KubeConfig: kubeconfig,
+				Namespace:  &namespace,
+				Context:    pointer.String("minikube"),
+			}, nil
+		},
 	}
 
 	tworker := temporal.New(c, *workflowTaskQueue, temporal.Options{})

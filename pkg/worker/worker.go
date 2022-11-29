@@ -6,13 +6,10 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 
 	"github.com/ethanfrogers/k8s-application-operator/api/v1alpha1"
 	"github.com/ethanfrogers/k8s-application-operator/pkg/apis/application"
@@ -26,17 +23,20 @@ import (
 )
 
 type Worker struct {
-	ApplicationsClient *application.Clientset
-	K8sClient          *kubernetes.Clientset
-	Client             client.Client
+	ApplicationsClient      *application.Clientset
+	K8sClient               *kubernetes.Clientset
+	Client                  client.Client
+	RestClientGetterFactory func(namespace string) (genericclioptions.RESTClientGetter, error)
 }
 
 func (w *Worker) Register(registry worker.Worker) {
 	registry.RegisterWorkflow(w.Reconcile)
 	registry.RegisterActivity(w.GetApplicationConfig)
-	registry.RegisterWorkflow(w.ManageEnvironment)
-	registry.RegisterActivity(w.InstallApplication)
-	registry.RegisterActivity(w.EnsureInstallation)
+	registry.RegisterActivity(w.DoDiff)
+	registry.RegisterActivity(w.DoCheck)
+	registry.RegisterActivity(w.DoPush)
+	registry.RegisterWorkflow(w.EnvironmentReconciler)
+	registry.RegisterActivity(w.UpdateDeployedVersions)
 }
 
 type ReconcileRequest struct {
@@ -67,13 +67,26 @@ func (w *Worker) Reconcile(ctx workflow.Context, req ReconcileRequest) error {
 			WorkflowID:        fmt.Sprintf("manage-%s-%s", key, env.Name),
 			ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
 		})
-		envReq := EnvironmentManagerRequest{
-			Name:            applicationConfig.ObjectMeta.Name,
-			SignalName:      signalName,
-			ParentNamespace: applicationConfig.ObjectMeta.Namespace,
+		envReq := EnvironmentReconcilerRequest{
+			SpecName:          applicationConfig.Name,
+			SpecNamespace:     applicationConfig.Namespace,
+			TargetEnvironment: env.Name,
 		}
-		manageWorkflow := workflow.ExecuteChildWorkflow(childOptions, w.EnvironmentManager, envReq)
+		manageWorkflow := workflow.ExecuteChildWorkflow(childOptions, w.EnvironmentReconciler, envReq)
 		environmentFutures = append(environmentFutures, manageWorkflow)
+	}
+
+	selector := workflow.NewSelector(ctx)
+	for _, f := range environmentFutures {
+		selector.AddFuture(f, func(f workflow.Future) {
+			if err := f.Get(ctx, nil); err != nil {
+				workflow.GetLogger(ctx).Error("reconciler workflow failed", "error", err)
+			}
+		})
+	}
+
+	for true {
+		selector.Select(ctx)
 	}
 
 	return nil
@@ -96,37 +109,6 @@ type InstallApplicationRequest struct {
 	Name      string
 	Namespace string
 	Artifacts []v1alpha1.Artifact
-}
-
-type InstallApplicationResponse struct {
-}
-
-func (w *Worker) InstallApplication(ctx context.Context, req *InstallApplicationRequest) (*InstallApplicationResponse, error) {
-	chartArtifact, err := findFirstArtifact(req.Artifacts, "HelmChart")
-	if err != nil {
-		return nil, err
-	}
-	chartPath, cleanup, err := downloadChartArtifact(ctx, chartArtifact.Repository, chartArtifact.Version)
-	if err != nil {
-		return nil, err
-	}
-	defer cleanup()
-	installName := req.Name
-	installNamespace := req.Namespace
-
-	args := []string{
-		"install",
-		installName,
-		"-n", installNamespace,
-		chartPath,
-	}
-	cmd := exec.Command("helm", args...)
-	if err := cmd.Run(); err != nil {
-		return nil, err
-	}
-
-	return &InstallApplicationResponse{}, nil
-
 }
 
 func findFirstArtifact(artifacts []v1alpha1.Artifact, kind string) (*v1alpha1.Artifact, error) {
@@ -171,35 +153,168 @@ type ModifyEnvironmentRequest struct {
 	Placement *v1alpha1.Placement
 }
 
-func (w *Worker) EnvironmentManager(ctx workflow.Context, req EnvironmentManagerRequest) error {
-	logger := workflow.GetLogger(ctx)
-	signalChan := workflow.GetSignalChannel(ctx, req.SignalName)
-	selector := workflow.NewSelector(ctx)
-	selector.AddReceive(signalChan, func(c workflow.ReceiveChannel, more bool) {
-		var modifyRequest ModifyEnvironmentRequest
-		c.Receive(ctx, &modifyRequest)
-		namespace := determinePlacement(req.ParentNamespace, modifyRequest.Placement)
-		installCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-			ScheduleToCloseTimeout: 10 * time.Minute,
-			RetryPolicy: &temporal.RetryPolicy{
-				MaximumAttempts: 1,
-			},
-		})
-		installRequest := InstallApplicationRequest{
-			Name:      req.Name,
-			Namespace: namespace,
-			Artifacts: modifyRequest.Artifacts,
-		}
-		installExec := workflow.ExecuteActivity(ctx, w.InstallApplication, installRequest)
-		var installResp InstallApplicationResponse
-		if err := installExec.Get(installCtx, &installResp); err != nil {
-			logger.Error("failed to install environment", "error", err)
-		}
-	})
+type EnvironmentReconcilerRequest struct {
+	SpecName, SpecNamespace string
+	TargetEnvironment       string
+}
 
+var defaultActivityOptions = workflow.ActivityOptions{
+	ScheduleToStartTimeout: 1 * time.Minute,
+	ScheduleToCloseTimeout: 1 * time.Minute,
+	RetryPolicy: &temporal.RetryPolicy{
+		MaximumAttempts: 1,
+	},
+}
+
+func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReconcilerRequest) error {
+	logger := workflow.GetLogger(ctx)
 	for true {
-		selector.Select(ctx)
+		workflow.Sleep(ctx, 1*time.Minute)
+		activityContext := workflow.WithActivityOptions(ctx, defaultActivityOptions)
+		var applicationConfig v1alpha1.Application
+		key := types.NamespacedName{Namespace: req.SpecNamespace, Name: req.SpecName}.String()
+		err := workflow.ExecuteActivity(activityContext, w.GetApplicationConfig, key).Get(ctx, &applicationConfig)
+		if err != nil {
+			return err
+		}
+
+		var environment *v1alpha1.Environment
+		for _, env := range applicationConfig.Spec.Environments {
+			if env.Name == req.TargetEnvironment {
+				environment = &env
+			}
+		}
+
+		if environment == nil {
+			return fmt.Errorf("environment with %s name is not specified", req.TargetEnvironment)
+		}
+
+		targetNamespace := determinePlacement(applicationConfig.ObjectMeta.Namespace, environment.Placement)
+		chartArtifact, _ := findFirstArtifact(applicationConfig.Spec.Artifacts, "HelmChart")
+
+		ddr := DoDiffRequest{
+			Name:           applicationConfig.Name,
+			Namespace:      targetNamespace,
+			TargetArtifact: *chartArtifact,
+		}
+
+		var isDiff bool
+		if err := workflow.ExecuteActivity(activityContext, w.DoDiff, ddr).Get(ctx, &isDiff); err != nil {
+			logger.Error(
+				"failed to determine diff, trying again later",
+				"error", err)
+			continue
+		}
+
+		if !isDiff {
+			logger.Info("no diff detected, will check again later")
+			continue
+		}
+
+		var checked bool
+		if err := workflow.ExecuteActivity(activityContext, w.DoCheck, nil).Get(ctx, &checked); err != nil {
+			logger.Error("unable to check for promotion, trying again later", "error", err)
+			continue
+		}
+
+		if !checked {
+			logger.Info("checks failed, unable to promote.")
+			continue
+		}
+
+		dpr := DoPushRequest{
+			Name:           applicationConfig.Name,
+			Namespace:      targetNamespace,
+			TargetArtifact: *chartArtifact,
+		}
+		var success bool
+		if err := workflow.ExecuteActivity(activityContext, w.DoPush, dpr).Get(ctx, &success); err != nil {
+			logger.Error("failed to reconcile environment, trying again later", "error", err)
+			continue
+		}
+		if success {
+			logger.Info("updated environment")
+		}
+
+		updateReq := UpdateDeployedVersionsRequest{
+			Name:             applicationConfig.Name,
+			Namespace:        applicationConfig.Namespace,
+			Environment:      req.TargetEnvironment,
+			DeployedArtifact: *chartArtifact,
+		}
+
+		if err := workflow.ExecuteActivity(activityContext, w.UpdateDeployedVersions, updateReq); err != nil {
+			logger.Error("failed to update deployed versions", "error", err)
+		}
 	}
+
+	return nil
+}
+
+type DoDiffRequest struct {
+	Name           string
+	Namespace      string
+	TargetArtifact v1alpha1.Artifact
+}
+
+func (w *Worker) DoDiff(ctx context.Context, req DoDiffRequest) (bool, error) {
+	rcg, _ := w.RestClientGetterFactory(req.Namespace)
+	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, req.TargetArtifact)
+	if err != nil {
+		return false, err
+	}
+	return hr.Diff(ctx)
+}
+
+func (w *Worker) DoCheck(ctx context.Context) (bool, error) {
+	return true, nil
+}
+
+type DoPushRequest struct {
+	Name           string
+	Namespace      string
+	TargetArtifact v1alpha1.Artifact
+}
+
+func (w *Worker) DoPush(ctx context.Context, req DoPushRequest) error {
+	rcg, _ := w.RestClientGetterFactory(req.Namespace)
+	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, req.TargetArtifact)
+	if err != nil {
+		return err
+	}
+	return hr.Push(ctx)
+}
+
+type UpdateDeployedVersionsRequest struct {
+	Name, Namespace, Environment string
+	DeployedArtifact             v1alpha1.Artifact
+}
+
+func (w *Worker) UpdateDeployedVersions(ctx context.Context, req UpdateDeployedVersionsRequest) error {
+	var applicationConfig v1alpha1.Application
+	namespacedName := types.NamespacedName{
+		Name:      req.Name,
+		Namespace: req.Namespace,
+	}
+	if err := w.Client.Get(ctx, namespacedName, &applicationConfig); err != nil {
+		return err
+	}
+
+	deployedArtifacts := applicationConfig.Status.DeployedArtifacts
+	if deployedArtifacts == nil {
+		deployedArtifacts = map[string]map[string]v1alpha1.Artifact{}
+	}
+	if _, ok := deployedArtifacts[req.Environment]; !ok {
+		deployedArtifacts[req.Environment] = map[string]v1alpha1.Artifact{}
+	}
+	deployedArtifacts[req.Environment][req.DeployedArtifact.Name] = req.DeployedArtifact
+
+	applicationConfig.Status.DeployedArtifacts = deployedArtifacts
+
+	if err := w.Client.Status().Update(ctx, &applicationConfig); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -209,85 +324,4 @@ func determinePlacement(parentNamespace string, placement *v1alpha1.Placement) s
 		namespace = placement.StaticPlacement.Namespace
 	}
 	return namespace
-}
-
-type ManageEnvironmentRequest struct {
-	Name      string
-	Namespace string
-	Artifacts []v1alpha1.Artifact
-	Placement *v1alpha1.Placement
-}
-
-func (w *Worker) ManageEnvironment(ctx workflow.Context, req ManageEnvironmentRequest) error {
-	logger := workflow.GetLogger(ctx)
-	name := req.Name
-	namespace := req.Namespace
-	if req.Placement != nil && req.Placement.StaticPlacement != nil {
-		namespace = req.Placement.StaticPlacement.Namespace
-	}
-	var err error
-	for err == nil {
-		workflow.Sleep(ctx, 1*time.Minute)
-		activityCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-			ScheduleToCloseTimeout: 1 * time.Minute,
-			RetryPolicy: &temporal.RetryPolicy{
-				MaximumAttempts: 1,
-			},
-		})
-		ensureReq := EnsureInstallationRequest{Name: name, Namespace: namespace}
-		var deployed bool
-		if err := workflow.ExecuteActivity(activityCtx, w.EnsureInstallation, ensureReq).Get(ctx, &deployed); err != nil {
-			logger.Error("unable to ensure environment, trying again", "error", err)
-			continue
-		}
-		if !deployed {
-			installCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-				ScheduleToCloseTimeout: 10 * time.Minute,
-				RetryPolicy: &temporal.RetryPolicy{
-					MaximumAttempts: 1,
-				},
-			})
-			installReq := InstallApplicationRequest{
-				Name:      name,
-				Namespace: namespace,
-				Artifacts: req.Artifacts,
-			}
-			var installResp InstallApplicationResponse
-			if err := workflow.ExecuteActivity(installCtx, w.InstallApplication, installReq).Get(ctx, &installResp); err != nil {
-				logger.Error("failed to install application, will try again", "error", err)
-			}
-		}
-
-	}
-	return nil
-}
-
-type EnsureInstallationRequest struct {
-	Name      string
-	Namespace string
-}
-
-func (w *Worker) EnsureInstallation(ctx context.Context, req EnsureInstallationRequest) (bool, error) {
-	ownerRequirement, err := labels.NewRequirement("owner", selection.Equals, []string{"helm"})
-	if err != nil {
-		return false, err
-	}
-	nameRequirement, err := labels.NewRequirement("name", selection.Equals, []string{req.Name})
-	if err != nil {
-		return false, err
-	}
-
-	listOptions := &client.ListOptions{
-		LabelSelector: labels.NewSelector().Add(*ownerRequirement, *nameRequirement),
-		Namespace:     req.Namespace,
-	}
-	var configMaps v1.ConfigMapList
-	if err := w.Client.List(ctx, &configMaps, listOptions); err != nil {
-		return false, err
-	}
-	if len(configMaps.Items) == 0 {
-		return false, nil
-	}
-
-	return true, nil
 }

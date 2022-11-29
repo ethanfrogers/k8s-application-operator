@@ -67,9 +67,10 @@ type ApplicationSpec struct {
 type ApplicationStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Conditions              []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
-	ControllerWorkflowID    string             `json:"controllerWorkflowID"`
-	ControllerWorkflowRunID string             `json:"controllerWorkflowRunID"`
+	Conditions              []metav1.Condition             `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
+	ControllerWorkflowID    string                         `json:"controllerWorkflowID"`
+	ControllerWorkflowRunID string                         `json:"controllerWorkflowRunID"`
+	DeployedArtifacts       map[string]map[string]Artifact `json:"deployedArtifacts,omitempty"`
 }
 
 //+kubebuilder:object:root=true
