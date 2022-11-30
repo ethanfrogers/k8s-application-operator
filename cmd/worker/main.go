@@ -70,7 +70,7 @@ func main() {
 			return &genericclioptions.ConfigFlags{
 				KubeConfig: kubeconfig,
 				Namespace:  &namespace,
-				Context:    pointer.String("minikube"),
+				Context:    pointer.String("microk8s"),
 			}, nil
 		},
 	}

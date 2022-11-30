@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"time"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -32,7 +33,7 @@ type Artifact struct {
 type Constraint struct {
 	Kind string `json:"kind"`
 
-	DependsOnConstraint *DependsOnConstraint `json:"dependsOnConstraint,omitempty"`
+	DependsOn *DependsOnConstraint `json:"dependsOn,omitempty"`
 }
 
 type DependsOnConstraint struct {
@@ -47,11 +48,25 @@ type Placement struct {
 	StaticPlacement *StaticPlacement `json:"staticPlacement,omitempty"`
 }
 
+type Verify struct {
+	Wait *time.Duration `json:"wait,omitempty"`
+}
+
+type PostDeploymentHooks struct {
+	Verify Verify `json:"verify,omitempty"`
+}
+
+type Lifecycle struct {
+	PostDeployment PostDeploymentHooks `json:"postDeployment,omitempty"`
+	OnFailure      string              `json:"onFailure,omitempty"`
+}
+
 type Environment struct {
 	Name              string       `json:"name"`
 	RequiredArtifacts []string     `json:"requiredArtifacts"`
 	Constraints       []Constraint `json:"constraints,omitempty"`
 	Placement         *Placement   `json:"placement,omitempty"`
+	Lifecycle         Lifecycle    `json:"lifecycle,omitempty"`
 }
 
 // ApplicationSpec defines the desired state of Application

@@ -33,10 +33,11 @@ func (w *Worker) Register(registry worker.Worker) {
 	registry.RegisterWorkflow(w.Reconcile)
 	registry.RegisterActivity(w.GetApplicationConfig)
 	registry.RegisterActivity(w.DoDiff)
-	registry.RegisterActivity(w.DoCheck)
+	registry.RegisterWorkflow(w.DoCheck)
 	registry.RegisterActivity(w.DoPush)
 	registry.RegisterWorkflow(w.EnvironmentReconciler)
 	registry.RegisterActivity(w.UpdateDeployedVersions)
+	registry.RegisterActivity(w.DependsOnConstraint)
 }
 
 type ReconcileRequest struct {
@@ -182,13 +183,14 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 		for _, env := range applicationConfig.Spec.Environments {
 			if env.Name == req.TargetEnvironment {
 				environment = &env
+				break
 			}
 		}
 
 		if environment == nil {
 			return fmt.Errorf("environment with %s name is not specified", req.TargetEnvironment)
 		}
-
+		logger.Info("beginning reconciliation for environment", "environment", environment.Name)
 		targetNamespace := determinePlacement(applicationConfig.ObjectMeta.Namespace, environment.Placement)
 		chartArtifact, _ := findFirstArtifact(applicationConfig.Spec.Artifacts, "HelmChart")
 
@@ -211,14 +213,23 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 			continue
 		}
 
+		doCheckReq := DoCheckRequest{
+			Name:           applicationConfig.Name,
+			Namespace:      applicationConfig.Namespace,
+			Constraints:    environment.Constraints,
+			TargetArtifact: *chartArtifact,
+		}
+		childWorkflowCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+			ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
+		})
 		var checked bool
-		if err := workflow.ExecuteActivity(activityContext, w.DoCheck, nil).Get(ctx, &checked); err != nil {
+		if err := workflow.ExecuteChildWorkflow(childWorkflowCtx, w.DoCheck, doCheckReq).Get(ctx, &checked); err != nil {
 			logger.Error("unable to check for promotion, trying again later", "error", err)
 			continue
 		}
 
 		if !checked {
-			logger.Info("checks failed, unable to promote.")
+			logger.Info("some checks are not ready, cannot promote artifact.")
 			continue
 		}
 
@@ -266,8 +277,98 @@ func (w *Worker) DoDiff(ctx context.Context, req DoDiffRequest) (bool, error) {
 	return hr.Diff(ctx)
 }
 
-func (w *Worker) DoCheck(ctx context.Context) (bool, error) {
-	return true, nil
+type DoCheckRequest struct {
+	Name, Namespace string
+	Constraints     []v1alpha1.Constraint
+	TargetArtifact  v1alpha1.Artifact
+}
+
+func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error) {
+	var futures []workflow.Future
+	if len(req.Constraints) == 0 {
+		return true, nil
+	}
+
+	for _, c := range req.Constraints {
+		switch c.Kind {
+		case "DependsOn":
+			activityContext := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+				ScheduleToCloseTimeout: 1 * time.Minute,
+				RetryPolicy: &temporal.RetryPolicy{
+					MaximumAttempts: 1,
+				},
+			})
+			req := DependsOnConstraintRequest{
+				Name:            req.Name,
+				Namespace:       req.Namespace,
+				TargetArtifact:  req.TargetArtifact,
+				EnvironmentName: c.DependsOn.EnvironmentName,
+			}
+			f := workflow.ExecuteActivity(activityContext, w.DependsOnConstraint, req)
+			futures = append(futures, f)
+		}
+	}
+
+	var checkErr error
+	collectedFutures := 0
+	canContinue := true
+	selector := workflow.NewSelector(ctx)
+	for _, f := range futures {
+		selector.AddFuture(f, func(f workflow.Future) {
+			collectedFutures += 1
+			var canProceed bool
+			if err := f.Get(ctx, &canProceed); err != nil {
+				checkErr = err
+			}
+			if canContinue == true && !canProceed {
+				canContinue = false
+			}
+		})
+	}
+
+	for collectedFutures < len(futures) && checkErr == nil {
+		selector.Select(ctx)
+	}
+
+	if checkErr != nil {
+		return false, checkErr
+	}
+
+	return canContinue, nil
+}
+
+type DependsOnConstraintRequest struct {
+	Name, Namespace string
+	TargetArtifact  v1alpha1.Artifact
+	EnvironmentName string
+}
+
+func (w *Worker) DependsOnConstraint(ctx context.Context, req DependsOnConstraintRequest) (bool, error) {
+	var applicationConfig v1alpha1.Application
+	namespacedName := types.NamespacedName{
+		Name:      req.Name,
+		Namespace: req.Namespace,
+	}
+	if err := w.Client.Get(ctx, namespacedName, &applicationConfig); err != nil {
+		return false, fmt.Errorf("failed to get application config: %w", err)
+	}
+
+	deployedArtifacts := applicationConfig.Status.DeployedArtifacts
+	if deployedArtifacts == nil {
+		return false, nil
+	}
+
+	envArtifacts, ok := deployedArtifacts[req.EnvironmentName]
+	if !ok {
+		return false, nil
+	}
+
+	artifact, ok := envArtifacts[req.TargetArtifact.Name]
+	if !ok {
+		return false, nil
+	}
+
+	return artifact.Version == req.TargetArtifact.Version, nil
 }
 
 type DoPushRequest struct {

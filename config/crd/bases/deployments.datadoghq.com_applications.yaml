@@ -58,7 +58,7 @@ spec:
                     constraints:
                       items:
                         properties:
-                          dependsOnConstraint:
+                          dependsOn:
                             properties:
                               environment:
                                 type: string
@@ -71,6 +71,24 @@ spec:
                         - kind
                         type: object
                       type: array
+                    lifecycle:
+                      properties:
+                        onFailure:
+                          type: string
+                        postDeployment:
+                          properties:
+                            verify:
+                              properties:
+                                wait:
+                                  description: A Duration represents the elapsed time
+                                    between two instants as an int64 nanosecond count.
+                                    The representation limits the largest representable
+                                    duration to approximately 290 years.
+                                  format: int64
+                                  type: integer
+                              type: object
+                          type: object
+                      type: object
                     name:
                       type: string
                     placement:

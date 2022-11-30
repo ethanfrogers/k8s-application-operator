@@ -16,3 +16,10 @@ spec:
           namespace: nginx-staging
       requiredArtifacts:
         - chart
+    - name: production
+      requiredArtifacts:
+        - chart
+      constraints:
+        - kind: DependsOn
+          dependsOn:
+            environment: staging
