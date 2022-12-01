@@ -208,7 +208,6 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 		}
 		logger.Info("beginning reconciliation for environment", "environment", environment.Name)
 		targetNamespace := determinePlacement(applicationConfig.ObjectMeta.Namespace, environment.Placement)
-		chartArtifact, _ := findFirstArtifact(applicationConfig.Spec.Artifacts, "HelmChart")
 
 		artifactsByName := map[string]v1alpha1.Artifact{}
 		for _, a := range applicationConfig.Spec.Artifacts {
@@ -276,10 +275,10 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 		}
 
 		updateReq := UpdateDeployedVersionsRequest{
-			Name:             applicationConfig.Name,
-			Namespace:        applicationConfig.Namespace,
-			Environment:      req.TargetEnvironment,
-			DeployedArtifact: *chartArtifact,
+			Name:              applicationConfig.Name,
+			Namespace:         applicationConfig.Namespace,
+			Environment:       req.TargetEnvironment,
+			DeployedArtifacts: filteredArtifacts,
 		}
 
 		if err := workflow.ExecuteActivity(activityContext, w.UpdateDeployedVersions, updateReq); err != nil {
@@ -312,50 +311,92 @@ type DoCheckRequest struct {
 }
 
 func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error) {
-	var futures []workflow.Future
+	logger := workflow.GetLogger(ctx)
 	if len(req.Constraints) == 0 {
+		logger.Info("environment has no constraints, proceeding.")
 		return true, nil
 	}
 
+	var (
+		statefulFutures  []futureProvider
+		statelessFutures []futureProvider
+	)
 	for _, c := range req.Constraints {
 		switch c.Kind {
 		case "DependsOn":
-			activityContext := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-				ScheduleToCloseTimeout: 1 * time.Minute,
-				RetryPolicy: &temporal.RetryPolicy{
-					MaximumAttempts: 1,
-				},
-			})
-			req := DependsOnConstraintRequest{
-				Name:            req.Name,
-				Namespace:       req.Namespace,
-				TargetArtifacts: req.TargetArtifacts,
-				EnvironmentName: c.DependsOn.EnvironmentName,
-				Artifacts:       c.DependsOn.Artifacts,
-			}
-			f := workflow.ExecuteActivity(activityContext, w.DependsOnConstraint, req)
-			futures = append(futures, f)
+			statelessFutures = append(statelessFutures, w.newDependsOnFutureProvider(req, *c.DependsOn))
 		case "HelmCanary":
-			childContext := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
-				ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
-			})
-			req := HelmCanaryRequest{
-				Name:             req.Name,
-				Namespace:        req.Namespace,
-				TargetArtifacts:  req.TargetArtifacts,
-				CanaryConstraint: *c.HelmCanary,
-			}
-			f := workflow.ExecuteChildWorkflow(childContext, w.HelmCanaryConstraint, req)
-			futures = append(futures, f)
+			statefulFutures = append(statefulFutures, w.newHelmCanaryFutureProvider(req, *c.HelmCanary))
 		}
 	}
 
+	// stateless constraints have to execute before stateful ones can run
+	canContinue, err := executeConstraints(ctx, statelessFutures)
+	if err != nil {
+		return false, err
+	}
+	if !canContinue {
+		return false, nil
+	}
+
+	canContinue, err = executeConstraints(ctx, statefulFutures)
+	if err != nil {
+		return false, err
+	}
+
+	return canContinue, nil
+}
+
+func (w *Worker) newDependsOnFutureProvider(req DoCheckRequest, dependsOn v1alpha1.DependsOnConstraint) futureProvider {
+	return func(ctx workflow.Context) workflow.Future {
+		activityContext := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			ScheduleToCloseTimeout: 1 * time.Minute,
+			RetryPolicy: &temporal.RetryPolicy{
+				MaximumAttempts: 1,
+			},
+		})
+		req := DependsOnConstraintRequest{
+			Name:            req.Name,
+			Namespace:       req.Namespace,
+			TargetArtifacts: req.TargetArtifacts,
+			EnvironmentName: dependsOn.EnvironmentName,
+			Artifacts:       dependsOn.Artifacts,
+		}
+		return workflow.ExecuteActivity(activityContext, w.DependsOnConstraint, req)
+	}
+}
+
+func (w *Worker) newHelmCanaryFutureProvider(req DoCheckRequest, canaryConfig v1alpha1.HelmCanaryConstraint) futureProvider {
+	return func(ctx workflow.Context) workflow.Future {
+		childContext := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+			ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
+		})
+		req := HelmCanaryRequest{
+			Name:             req.Name,
+			Namespace:        req.Namespace,
+			TargetArtifacts:  req.TargetArtifacts,
+			CanaryConstraint: canaryConfig,
+		}
+		return workflow.ExecuteChildWorkflow(childContext, w.HelmCanaryConstraint, req)
+	}
+
+}
+
+type futureProvider func(ctx workflow.Context) workflow.Future
+
+func executeConstraints(ctx workflow.Context, providers []futureProvider) (bool, error) {
 	var checkErr error
 	collectedFutures := 0
 	canContinue := true
+
+	if len(providers) == 0 {
+		return true, nil
+	}
+
 	selector := workflow.NewSelector(ctx)
-	for _, f := range futures {
-		selector.AddFuture(f, func(f workflow.Future) {
+	for _, provider := range providers {
+		future := provider(ctx)
+		selector.AddFuture(future, func(f workflow.Future) {
 			collectedFutures += 1
 			var canProceed bool
 			if err := f.Get(ctx, &canProceed); err != nil {
@@ -367,12 +408,12 @@ func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error)
 		})
 	}
 
-	for collectedFutures < len(futures) {
+	if collectedFutures < len(providers) {
 		selector.Select(ctx)
 	}
 
 	if checkErr != nil {
-		return false, checkErr
+		return false, nil
 	}
 
 	return canContinue, nil
@@ -445,6 +486,10 @@ func (w *Worker) HelmCanaryConstraint(ctx workflow.Context, req HelmCanaryReques
 	}, req.TargetArtifacts...)
 
 	name := fmt.Sprintf("%s-canary", req.Name)
+	canaryDuration, err := time.ParseDuration(req.CanaryConstraint.TTL)
+	if err != nil {
+		return false, err
+	}
 
 	activityContext := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: 5 * time.Minute,
@@ -462,6 +507,9 @@ func (w *Worker) HelmCanaryConstraint(ctx workflow.Context, req HelmCanaryReques
 	if err := workflow.ExecuteActivity(activityContext, w.DoPush, pushReq).Get(ctx, nil); err != nil {
 		return false, fmt.Errorf("could not push canary %w", err)
 	}
+
+	// wait for some amount of time to simulate running canary validation
+	workflow.Sleep(ctx, canaryDuration)
 
 	return true, nil
 }
@@ -496,7 +544,7 @@ func (w *Worker) DoDelete(ctx context.Context, req DoDeleteRequest) error {
 
 type UpdateDeployedVersionsRequest struct {
 	Name, Namespace, Environment string
-	DeployedArtifact             v1alpha1.Artifact
+	DeployedArtifacts            []v1alpha1.Artifact
 }
 
 func (w *Worker) UpdateDeployedVersions(ctx context.Context, req UpdateDeployedVersionsRequest) error {
@@ -516,7 +564,9 @@ func (w *Worker) UpdateDeployedVersions(ctx context.Context, req UpdateDeployedV
 	if _, ok := deployedArtifacts[req.Environment]; !ok {
 		deployedArtifacts[req.Environment] = map[string]v1alpha1.Artifact{}
 	}
-	deployedArtifacts[req.Environment][req.DeployedArtifact.Name] = req.DeployedArtifact
+	for _, a := range req.DeployedArtifacts {
+		deployedArtifacts[req.Environment][a.Name] = a
+	}
 
 	applicationConfig.Status.DeployedArtifacts = deployedArtifacts
 

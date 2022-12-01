@@ -20,28 +20,34 @@ spec:
     - kind: HelmValues
       name: valuesProd
       values:
-        replicaCount: 3
+        replicaCount: 4
   environments:
     - name: staging
+      # requiredArtifacts are all the artifacts that should
+      # be deployed to this environment
+      requiredArtifacts: ["chart", "common", "valuesStaging"]
       placement:
+        # staticPlacement defines an explicit namespace
+        # that this should be deployed in
         staticPlacement:
           namespace: nginx-staging
-      requiredArtifacts:
-        - chart
-        - common
-        - valuesStaging
     - name: production
-      requiredArtifacts:
-        - chart
-        - common
-        - valuesProd
+      requiredArtifacts: ["chart", "common", "valuesStaging"]
+      # constraints defines a set of gates that have to succeed before
+      # this environment can be deployed to
       constraints:
+        # DependsOn specifies that it's artifacts must have been applied
+        # in a lower priotity environment
         - kind: DependsOn
           dependsOn:
             environment: staging
             artifacts:
               - chart
               - common
+        # Before a deployment can happen in this environment
+        # a canary must be deployed. Eventually, we will
+        # run post-deployment verification before calling
+        # this constraint successful
         - kind: HelmCanary
           helmCanary:
             ttl: 2m
