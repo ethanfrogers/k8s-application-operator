@@ -33,6 +33,7 @@ func main() {
 	workflowTaskQueue := flag.String("workflow-task-queue", "application-reconciler", "")
 	temporalHost := flag.String("temporal-host", "localhost:7233", "")
 	kubeconfig := flag.String("kubeconfig", "", "")
+	kubeContext := flag.String("context", "microk8s", "")
 	flag.Parse()
 
 	logger, err := zap.NewDevelopment()
@@ -70,7 +71,7 @@ func main() {
 			return &genericclioptions.ConfigFlags{
 				KubeConfig: kubeconfig,
 				Namespace:  &namespace,
-				Context:    pointer.String("microk8s"),
+				Context:    pointer.String(*kubeContext),
 			}, nil
 		},
 	}
