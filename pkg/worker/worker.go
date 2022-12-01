@@ -122,6 +122,20 @@ func findFirstArtifact(artifacts []v1alpha1.Artifact, kind string) (*v1alpha1.Ar
 	return nil, fmt.Errorf("artifact of kind %s not found", kind)
 }
 
+func findAllArtifacts(artifacts []v1alpha1.Artifact, kind string) ([]v1alpha1.Artifact, error) {
+	var a []v1alpha1.Artifact
+	for _, artifact := range artifacts {
+		if artifact.Kind == kind {
+			a = append(a, artifact)
+		}
+	}
+	if len(a) == 0 {
+		return nil, fmt.Errorf("no artifacts of type %s found", kind)
+	}
+
+	return a, nil
+}
+
 func downloadChartArtifact(ctx context.Context, reference, version string) (string, func(), error) {
 	url := fmt.Sprintf("%s-%s.tgz", reference, version)
 	resp, err := http.Get(url)
@@ -194,10 +208,22 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 		targetNamespace := determinePlacement(applicationConfig.ObjectMeta.Namespace, environment.Placement)
 		chartArtifact, _ := findFirstArtifact(applicationConfig.Spec.Artifacts, "HelmChart")
 
+		artifactsByName := map[string]v1alpha1.Artifact{}
+		for _, a := range applicationConfig.Spec.Artifacts {
+			artifactsByName[a.Name] = a
+		}
+
+		var filteredArtifacts []v1alpha1.Artifact
+		for _, required := range environment.RequiredArtifacts {
+			if a, ok := artifactsByName[required]; ok {
+				filteredArtifacts = append(filteredArtifacts, a)
+			}
+		}
+
 		ddr := DoDiffRequest{
-			Name:           applicationConfig.Name,
-			Namespace:      targetNamespace,
-			TargetArtifact: *chartArtifact,
+			Name:            applicationConfig.Name,
+			Namespace:       targetNamespace,
+			TargetArtifacts: filteredArtifacts,
 		}
 
 		var isDiff bool
@@ -214,10 +240,10 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 		}
 
 		doCheckReq := DoCheckRequest{
-			Name:           applicationConfig.Name,
-			Namespace:      applicationConfig.Namespace,
-			Constraints:    environment.Constraints,
-			TargetArtifact: *chartArtifact,
+			Name:            applicationConfig.Name,
+			Namespace:       applicationConfig.Namespace,
+			Constraints:     environment.Constraints,
+			TargetArtifacts: filteredArtifacts,
 		}
 		childWorkflowCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
 			ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
@@ -234,9 +260,9 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 		}
 
 		dpr := DoPushRequest{
-			Name:           applicationConfig.Name,
-			Namespace:      targetNamespace,
-			TargetArtifact: *chartArtifact,
+			Name:            applicationConfig.Name,
+			Namespace:       targetNamespace,
+			TargetArtifacts: filteredArtifacts,
 		}
 		var success bool
 		if err := workflow.ExecuteActivity(activityContext, w.DoPush, dpr).Get(ctx, &success); err != nil {
@@ -263,14 +289,14 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 }
 
 type DoDiffRequest struct {
-	Name           string
-	Namespace      string
-	TargetArtifact v1alpha1.Artifact
+	Name            string
+	Namespace       string
+	TargetArtifacts []v1alpha1.Artifact
 }
 
 func (w *Worker) DoDiff(ctx context.Context, req DoDiffRequest) (bool, error) {
 	rcg, _ := w.RestClientGetterFactory(req.Namespace)
-	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, req.TargetArtifact)
+	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, req.TargetArtifacts)
 	if err != nil {
 		return false, err
 	}
@@ -280,7 +306,7 @@ func (w *Worker) DoDiff(ctx context.Context, req DoDiffRequest) (bool, error) {
 type DoCheckRequest struct {
 	Name, Namespace string
 	Constraints     []v1alpha1.Constraint
-	TargetArtifact  v1alpha1.Artifact
+	TargetArtifacts []v1alpha1.Artifact
 }
 
 func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error) {
@@ -301,8 +327,9 @@ func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error)
 			req := DependsOnConstraintRequest{
 				Name:            req.Name,
 				Namespace:       req.Namespace,
-				TargetArtifact:  req.TargetArtifact,
+				TargetArtifacts: req.TargetArtifacts,
 				EnvironmentName: c.DependsOn.EnvironmentName,
+				Artifacts:       c.DependsOn.Artifacts,
 			}
 			f := workflow.ExecuteActivity(activityContext, w.DependsOnConstraint, req)
 			futures = append(futures, f)
@@ -339,8 +366,9 @@ func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error)
 
 type DependsOnConstraintRequest struct {
 	Name, Namespace string
-	TargetArtifact  v1alpha1.Artifact
+	TargetArtifacts []v1alpha1.Artifact
 	EnvironmentName string
+	Artifacts       []string
 }
 
 func (w *Worker) DependsOnConstraint(ctx context.Context, req DependsOnConstraintRequest) (bool, error) {
@@ -363,23 +391,42 @@ func (w *Worker) DependsOnConstraint(ctx context.Context, req DependsOnConstrain
 		return false, nil
 	}
 
-	artifact, ok := envArtifacts[req.TargetArtifact.Name]
-	if !ok {
-		return false, nil
+	artifactsByName := map[string]v1alpha1.Artifact{}
+	for _, a := range applicationConfig.Spec.Artifacts {
+		artifactsByName[a.Name] = a
 	}
 
-	return artifact.Version == req.TargetArtifact.Version, nil
+	// for each dependent artifact, check the deployed
+	// versions of those artifacts
+	for _, a := range req.Artifacts {
+		deployedArtifact, ok := envArtifacts[a]
+		if !ok {
+			return false, nil
+		}
+
+		targetArtifact, ok := artifactsByName[a]
+		if !ok {
+			return false, nil
+		}
+
+		if deployedArtifact.Version != targetArtifact.Version {
+			return false, nil
+		}
+
+	}
+	return true, nil
+
 }
 
 type DoPushRequest struct {
-	Name           string
-	Namespace      string
-	TargetArtifact v1alpha1.Artifact
+	Name            string
+	Namespace       string
+	TargetArtifacts []v1alpha1.Artifact
 }
 
 func (w *Worker) DoPush(ctx context.Context, req DoPushRequest) error {
 	rcg, _ := w.RestClientGetterFactory(req.Namespace)
-	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, req.TargetArtifact)
+	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, req.TargetArtifacts)
 	if err != nil {
 		return err
 	}

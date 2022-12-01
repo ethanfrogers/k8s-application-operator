@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"time"
 )
 
@@ -25,11 +26,13 @@ import (
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 type Artifact struct {
-	Name       string `json:"name"`
-	Kind       string `json:"kind"`
-	Repository string `json:"repository"`
-	Version    string `json:"version,omitempty"`
+	Name       string               `json:"name"`
+	Kind       string               `json:"kind"`
+	Repository string               `json:"repository,omitempty"`
+	Version    string               `json:"version,omitempty"`
+	Values     runtime.RawExtension `json:"values,omitempty"`
 }
+
 type Constraint struct {
 	Kind string `json:"kind"`
 
@@ -37,7 +40,8 @@ type Constraint struct {
 }
 
 type DependsOnConstraint struct {
-	EnvironmentName string `json:"environment"`
+	EnvironmentName string   `json:"environment"`
+	Artifacts       []string `json:"artifacts,omitempty"`
 }
 
 type StaticPlacement struct {

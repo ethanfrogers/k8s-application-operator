@@ -44,12 +44,14 @@ spec:
                       type: string
                     repository:
                       type: string
+                    values:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
                     version:
                       type: string
                   required:
                   - kind
                   - name
-                  - repository
                   type: object
                 type: array
               environments:
@@ -60,6 +62,10 @@ spec:
                         properties:
                           dependsOn:
                             properties:
+                              artifacts:
+                                items:
+                                  type: string
+                                type: array
                               environment:
                                 type: string
                             required:
@@ -202,12 +208,14 @@ spec:
                         type: string
                       repository:
                         type: string
+                      values:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
                       version:
                         type: string
                     required:
                     - kind
                     - name
-                    - repository
                     type: object
                   type: object
                 type: object

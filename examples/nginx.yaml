@@ -2,13 +2,21 @@ apiVersion: deployments.datadoghq.com/v1alpha1
 kind: Application
 metadata:
   name: nginx
-  namespace: default
+  namespace: nginx
 spec:
   artifacts:
     - kind: HelmChart
       name: chart
       repository: https://charts.bitnami.com/bitnami/nginx
       version: 13.2.12
+    - kind: HelmValues
+      name: valuesStaging
+      values:
+        replicaCount: 1
+    - kind: HelmValues
+      name: valuesProd
+      values:
+        replicaCount: 1
   environments:
     - name: staging
       placement:
@@ -16,10 +24,14 @@ spec:
           namespace: nginx-staging
       requiredArtifacts:
         - chart
+        - valuesStaging
     - name: production
       requiredArtifacts:
         - chart
+        - valuesProd
       constraints:
         - kind: DependsOn
           dependsOn:
             environment: staging
+            artifacts:
+              - chart
