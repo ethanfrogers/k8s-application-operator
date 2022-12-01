@@ -111,6 +111,7 @@ func mergeMaps(a, b map[string]interface{}) map[string]interface{} {
 }
 
 func (hr *HelmReconciler) Push(ctx context.Context) error {
+	logger := activity.GetLogger(ctx)
 	isUpgrade := true
 	_, err := hr.Config.Releases.Deployed(hr.ReleaseName)
 	if errors.Is(err, driver.ErrNoDeployedReleases) {
@@ -138,11 +139,43 @@ func (hr *HelmReconciler) Push(ctx context.Context) error {
 		return err
 	}
 
+	var rolloutErr error
 	if isUpgrade {
-		return hr.doUpgrade(ctx, chartPath, mergedValues)
+		rolloutErr = hr.doUpgrade(ctx, chartPath, mergedValues)
+	} else {
+		rolloutErr = hr.doInstall(ctx, chartPath, mergedValues)
 	}
 
-	return hr.doInstall(ctx, chartPath, mergedValues)
+	if rolloutErr != nil {
+		return rolloutErr
+	}
+
+	canaryCleanupErr := hr.cleanupCanaries(ctx)
+	if canaryCleanupErr != nil {
+		logger.Error("failed to clean up canaries", "error", canaryCleanupErr)
+	}
+
+	return nil
+
+}
+
+func (hr *HelmReconciler) cleanupCanaries(ctx context.Context) error {
+	logger := activity.GetLogger(ctx)
+	canaryName := fmt.Sprintf("%s-canary", hr.ReleaseName)
+	canaryReleases, err := hr.Config.Releases.History(canaryName)
+	if err != nil {
+		if errors.Is(err, driver.ErrReleaseNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	if len(canaryReleases) < 1 {
+		logger.Info("no canaries to cleanup")
+		return nil
+	}
+
+	return hr.doDelete(ctx, canaryName)
 }
 
 func (hr *HelmReconciler) doInstall(ctx context.Context, chartPath string, values map[string]interface{}) error {
@@ -166,5 +199,11 @@ func (hr *HelmReconciler) doUpgrade(ctx context.Context, chartPath string, value
 	}
 
 	_, err = upgradeAction.Run(hr.ReleaseName, chart, values)
+	return err
+}
+
+func (hr *HelmReconciler) doDelete(ctx context.Context, name string) error {
+	deleteAction := action.NewUninstall(hr.Config)
+	_, err := deleteAction.Run(name)
 	return err
 }

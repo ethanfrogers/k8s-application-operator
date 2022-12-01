@@ -2,15 +2,19 @@ package worker
 
 import (
 	"fmt"
-	"helm.sh/helm/v3/pkg/cli/values"
+	"github.com/ethanfrogers/k8s-application-operator/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"testing"
 )
 
 func TestMergeValues(t *testing.T) {
-	s1 := `{"replicaCount": "1"}`
-	opts := values.Options{Values: []string{s1}}
-	v, err := opts.MergeValues(nil)
+	a := []v1alpha1.Artifact{
+		{Values: runtime.RawExtension{Raw: []byte(`{"replicaCount": 1}`)}},
+		{Values: runtime.RawExtension{Raw: []byte(`{"replicaCount": 3}`)}},
+	}
+
+	m, err := getMergedValues(a)
+	fmt.Println(m)
 	fmt.Println(err)
-	fmt.Println(v)
 	t.Fail()
 }

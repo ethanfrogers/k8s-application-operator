@@ -71,6 +71,14 @@ spec:
                             required:
                             - environment
                             type: object
+                          helmCanary:
+                            properties:
+                              ttl:
+                                type: string
+                              values:
+                                type: object
+                                x-kubernetes-preserve-unknown-fields: true
+                            type: object
                           kind:
                             type: string
                         required:

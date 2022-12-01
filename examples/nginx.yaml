@@ -8,7 +8,11 @@ spec:
     - kind: HelmChart
       name: chart
       repository: https://charts.bitnami.com/bitnami/nginx
-      version: 13.2.12
+      version: 13.2.13
+    - kind: HelmValues
+      name: common
+      values:
+        image.tag: 1.22.1
     - kind: HelmValues
       name: valuesStaging
       values:
@@ -16,7 +20,7 @@ spec:
     - kind: HelmValues
       name: valuesProd
       values:
-        replicaCount: 1
+        replicaCount: 3
   environments:
     - name: staging
       placement:
@@ -24,10 +28,12 @@ spec:
           namespace: nginx-staging
       requiredArtifacts:
         - chart
+        - common
         - valuesStaging
     - name: production
       requiredArtifacts:
         - chart
+        - common
         - valuesProd
       constraints:
         - kind: DependsOn
@@ -35,3 +41,9 @@ spec:
             environment: staging
             artifacts:
               - chart
+              - common
+        - kind: HelmCanary
+          helmCanary:
+            ttl: 2m
+            values:
+              replicaCount: 1

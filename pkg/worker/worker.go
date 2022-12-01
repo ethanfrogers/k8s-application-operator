@@ -38,6 +38,8 @@ func (w *Worker) Register(registry worker.Worker) {
 	registry.RegisterWorkflow(w.EnvironmentReconciler)
 	registry.RegisterActivity(w.UpdateDeployedVersions)
 	registry.RegisterActivity(w.DependsOnConstraint)
+	registry.RegisterActivity(w.DoDelete)
+	registry.RegisterWorkflow(w.HelmCanaryConstraint)
 }
 
 type ReconcileRequest struct {
@@ -241,7 +243,7 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 
 		doCheckReq := DoCheckRequest{
 			Name:            applicationConfig.Name,
-			Namespace:       applicationConfig.Namespace,
+			Namespace:       targetNamespace,
 			Constraints:     environment.Constraints,
 			TargetArtifacts: filteredArtifacts,
 		}
@@ -333,6 +335,18 @@ func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error)
 			}
 			f := workflow.ExecuteActivity(activityContext, w.DependsOnConstraint, req)
 			futures = append(futures, f)
+		case "HelmCanary":
+			childContext := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+				ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
+			})
+			req := HelmCanaryRequest{
+				Name:             req.Name,
+				Namespace:        req.Namespace,
+				TargetArtifacts:  req.TargetArtifacts,
+				CanaryConstraint: *c.HelmCanary,
+			}
+			f := workflow.ExecuteChildWorkflow(childContext, w.HelmCanaryConstraint, req)
+			futures = append(futures, f)
 		}
 	}
 
@@ -353,7 +367,7 @@ func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error)
 		})
 	}
 
-	for collectedFutures < len(futures) && checkErr == nil {
+	for collectedFutures < len(futures) {
 		selector.Select(ctx)
 	}
 
@@ -418,6 +432,40 @@ func (w *Worker) DependsOnConstraint(ctx context.Context, req DependsOnConstrain
 
 }
 
+type HelmCanaryRequest struct {
+	Name             string
+	Namespace        string
+	TargetArtifacts  []v1alpha1.Artifact
+	CanaryConstraint v1alpha1.HelmCanaryConstraint
+}
+
+func (w *Worker) HelmCanaryConstraint(ctx workflow.Context, req HelmCanaryRequest) (bool, error) {
+	artifacts := append([]v1alpha1.Artifact{
+		{Kind: "HelmValues", Values: req.CanaryConstraint.Values},
+	}, req.TargetArtifacts...)
+
+	name := fmt.Sprintf("%s-canary", req.Name)
+
+	activityContext := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 5 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 2,
+		},
+	})
+
+	pushReq := DoPushRequest{
+		Name:            name,
+		Namespace:       req.Namespace,
+		TargetArtifacts: artifacts,
+	}
+
+	if err := workflow.ExecuteActivity(activityContext, w.DoPush, pushReq).Get(ctx, nil); err != nil {
+		return false, fmt.Errorf("could not push canary %w", err)
+	}
+
+	return true, nil
+}
+
 type DoPushRequest struct {
 	Name            string
 	Namespace       string
@@ -431,6 +479,19 @@ func (w *Worker) DoPush(ctx context.Context, req DoPushRequest) error {
 		return err
 	}
 	return hr.Push(ctx)
+}
+
+type DoDeleteRequest struct {
+	Name, Namespace string
+}
+
+func (w *Worker) DoDelete(ctx context.Context, req DoDeleteRequest) error {
+	rcg, _ := w.RestClientGetterFactory(req.Namespace)
+	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, nil)
+	if err != nil {
+		return err
+	}
+	return hr.doDelete(ctx, req.Namespace)
 }
 
 type UpdateDeployedVersionsRequest struct {

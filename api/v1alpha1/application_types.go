@@ -36,12 +36,18 @@ type Artifact struct {
 type Constraint struct {
 	Kind string `json:"kind"`
 
-	DependsOn *DependsOnConstraint `json:"dependsOn,omitempty"`
+	DependsOn  *DependsOnConstraint  `json:"dependsOn,omitempty"`
+	HelmCanary *HelmCanaryConstraint `json:"helmCanary,omitempty"`
 }
 
 type DependsOnConstraint struct {
 	EnvironmentName string   `json:"environment"`
 	Artifacts       []string `json:"artifacts,omitempty"`
+}
+
+type HelmCanaryConstraint struct {
+	TTL    string               `json:"ttl,omitempty"`
+	Values runtime.RawExtension `json:"values,omitempty"`
 }
 
 type StaticPlacement struct {
