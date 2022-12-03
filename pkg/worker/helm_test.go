@@ -2,19 +2,41 @@ package worker
 
 import (
 	"fmt"
-	"github.com/ethanfrogers/k8s-application-operator/api/v1alpha1"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"testing"
 )
 
-func TestMergeValues(t *testing.T) {
-	a := []v1alpha1.Artifact{
-		{Values: runtime.RawExtension{Raw: []byte(`{"replicaCount": 1}`)}},
-		{Values: runtime.RawExtension{Raw: []byte(`{"replicaCount": 3}`)}},
+func TestLabelSelection(t *testing.T) {
+	targetLabels := map[string]string{
+		"env": "staging",
 	}
 
-	m, err := getMergedValues(a)
-	fmt.Println(m)
-	fmt.Println(err)
+	labelsSets := map[string]map[string]string{
+		"foo1": {
+			"env":     "prod",
+			"ignored": "true",
+		},
+		"foo2": {
+			"env": "staging",
+		},
+	}
+
+	requirements := labels.Requirements{}
+	for k, v := range targetLabels {
+		req, _ := labels.NewRequirement(k, selection.Equals, []string{v})
+		requirements = append(requirements, *req)
+	}
+
+	var collected []string
+	selector := labels.NewSelector().Add(requirements...)
+	for k, l := range labelsSets {
+		if selector.Matches(labels.Set(l)) {
+			collected = append(collected, k)
+		}
+	}
+
+	fmt.Println(collected)
 	t.Fail()
+
 }

@@ -2,8 +2,11 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"net/http"
 	"os"
 	"strings"
@@ -26,7 +29,7 @@ type Worker struct {
 	ApplicationsClient      *application.Clientset
 	K8sClient               *kubernetes.Clientset
 	Client                  client.Client
-	RestClientGetterFactory func(namespace string) (genericclioptions.RESTClientGetter, error)
+	RestClientGetterFactory func(cluster, namespace string) (genericclioptions.RESTClientGetter, error)
 }
 
 func (w *Worker) Register(registry worker.Worker) {
@@ -38,8 +41,9 @@ func (w *Worker) Register(registry worker.Worker) {
 	registry.RegisterWorkflow(w.EnvironmentReconciler)
 	registry.RegisterActivity(w.UpdateDeployedVersions)
 	registry.RegisterActivity(w.DependsOnConstraint)
-	registry.RegisterActivity(w.DoDelete)
 	registry.RegisterWorkflow(w.HelmCanaryConstraint)
+	registry.RegisterWorkflow(w.ReconcilePlacement)
+	registry.RegisterActivity(w.DeterminePlacement)
 }
 
 type ReconcileRequest struct {
@@ -47,6 +51,7 @@ type ReconcileRequest struct {
 }
 
 func (w *Worker) Reconcile(ctx workflow.Context, req ReconcileRequest) error {
+	logger := workflow.GetLogger(ctx)
 	activityContext := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		ScheduleToStartTimeout: 1 * time.Minute,
 		ScheduleToCloseTimeout: 1 * time.Minute,
@@ -54,42 +59,55 @@ func (w *Worker) Reconcile(ctx workflow.Context, req ReconcileRequest) error {
 			MaximumAttempts: 1,
 		},
 	})
-	var applicationConfig v1alpha1.Application
-	key := types.NamespacedName{Namespace: req.Namespace, Name: req.Name}.String()
-	err := workflow.ExecuteActivity(activityContext, w.GetApplicationConfig, key).Get(ctx, &applicationConfig)
-	if err != nil {
-		return err
-	}
-
-	environmentSignalNames := map[string]string{}
-	var environmentFutures []workflow.Future
-	for _, env := range applicationConfig.Spec.Environments {
-		signalName := fmt.Sprintf("modify-%s", env.Name)
-		environmentSignalNames[env.Name] = signalName
-		childOptions := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
-			WorkflowID:        fmt.Sprintf("manage-%s-%s", key, env.Name),
-			ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
-		})
-		envReq := EnvironmentReconcilerRequest{
-			SpecName:          applicationConfig.Name,
-			SpecNamespace:     applicationConfig.Namespace,
-			TargetEnvironment: env.Name,
-		}
-		manageWorkflow := workflow.ExecuteChildWorkflow(childOptions, w.EnvironmentReconciler, envReq)
-		environmentFutures = append(environmentFutures, manageWorkflow)
-	}
-
-	selector := workflow.NewSelector(ctx)
-	for _, f := range environmentFutures {
-		selector.AddFuture(f, func(f workflow.Future) {
-			if err := f.Get(ctx, nil); err != nil {
-				workflow.GetLogger(ctx).Error("reconciler workflow failed", "error", err)
-			}
-		})
-	}
 
 	for true {
-		selector.Select(ctx)
+		workflow.Sleep(ctx, 30*time.Second)
+		var applicationConfig v1alpha1.Application
+		key := types.NamespacedName{Namespace: req.Namespace, Name: req.Name}.String()
+		err := workflow.ExecuteActivity(activityContext, w.GetApplicationConfig, key).Get(ctx, &applicationConfig)
+		if err != nil {
+			return err
+		}
+
+		environmentSignalNames := map[string]string{}
+		var environmentFutures []workflow.Future
+		for _, env := range applicationConfig.Spec.Environments {
+			signalName := fmt.Sprintf("modify-%s", env.Name)
+			environmentSignalNames[env.Name] = signalName
+			childOptions := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+				WorkflowID:        fmt.Sprintf("manage-%s-%s", key, env.Name),
+				ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
+			})
+			envReq := EnvironmentReconcilerRequest{
+				SpecName:          applicationConfig.Name,
+				SpecNamespace:     applicationConfig.Namespace,
+				TargetEnvironment: env.Name,
+			}
+			manageWorkflow := workflow.ExecuteChildWorkflow(childOptions, w.EnvironmentReconciler, envReq)
+			environmentFutures = append(environmentFutures, manageWorkflow)
+		}
+
+		selector := workflow.NewSelector(ctx)
+		collectedFutures := 0
+		var reconcileErrs []error
+		for _, f := range environmentFutures {
+			selector.AddFuture(f, func(f workflow.Future) {
+				collectedFutures += 1
+				if err := f.Get(ctx, nil); err != nil {
+					reconcileErrs = append(reconcileErrs, err)
+				}
+			})
+		}
+
+		for collectedFutures < len(environmentFutures) {
+			selector.Select(ctx)
+		}
+
+		if len(reconcileErrs) > 0 {
+			for _, err := range reconcileErrs {
+				logger.Error("failed reconciliation", "error", err)
+			}
+		}
 	}
 
 	return nil
@@ -185,105 +203,172 @@ var defaultActivityOptions = workflow.ActivityOptions{
 
 func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReconcilerRequest) error {
 	logger := workflow.GetLogger(ctx)
-	for true {
-		workflow.Sleep(ctx, 1*time.Minute)
-		activityContext := workflow.WithActivityOptions(ctx, defaultActivityOptions)
-		var applicationConfig v1alpha1.Application
-		key := types.NamespacedName{Namespace: req.SpecNamespace, Name: req.SpecName}.String()
-		err := workflow.ExecuteActivity(activityContext, w.GetApplicationConfig, key).Get(ctx, &applicationConfig)
-		if err != nil {
-			return err
-		}
 
-		var environment *v1alpha1.Environment
-		for _, env := range applicationConfig.Spec.Environments {
-			if env.Name == req.TargetEnvironment {
-				environment = &env
-				break
-			}
-		}
+	activityContext := workflow.WithActivityOptions(ctx, defaultActivityOptions)
+	var applicationConfig v1alpha1.Application
+	key := types.NamespacedName{Namespace: req.SpecNamespace, Name: req.SpecName}.String()
+	err := workflow.ExecuteActivity(activityContext, w.GetApplicationConfig, key).Get(ctx, &applicationConfig)
+	if err != nil {
+		return err
+	}
 
-		if environment == nil {
-			return fmt.Errorf("environment with %s name is not specified", req.TargetEnvironment)
+	var environment *v1alpha1.Environment
+	for _, env := range applicationConfig.Spec.Environments {
+		if env.Name == req.TargetEnvironment {
+			environment = &env
+			break
 		}
-		logger.Info("beginning reconciliation for environment", "environment", environment.Name)
-		targetNamespace := determinePlacement(applicationConfig.ObjectMeta.Namespace, environment.Placement)
+	}
 
-		artifactsByName := map[string]v1alpha1.Artifact{}
-		for _, a := range applicationConfig.Spec.Artifacts {
-			artifactsByName[a.Name] = a
-		}
+	if environment == nil {
+		return fmt.Errorf("environment with %s name is not specified", req.TargetEnvironment)
+	}
+	logger.Info("beginning reconciliation for environment", "environment", environment.Name)
 
-		var filteredArtifacts []v1alpha1.Artifact
-		for _, required := range environment.RequiredArtifacts {
-			if a, ok := artifactsByName[required]; ok {
-				filteredArtifacts = append(filteredArtifacts, a)
-			}
-		}
+	placementActivityCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 1 * time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 1,
+		},
+	})
 
-		ddr := DoDiffRequest{
-			Name:            applicationConfig.Name,
-			Namespace:       targetNamespace,
-			TargetArtifacts: filteredArtifacts,
-		}
+	parentNamespace := applicationConfig.Namespace
+	activityExec := workflow.ExecuteActivity(placementActivityCtx, w.DeterminePlacement, parentNamespace, environment.Placement)
 
-		var isDiff bool
-		if err := workflow.ExecuteActivity(activityContext, w.DoDiff, ddr).Get(ctx, &isDiff); err != nil {
-			logger.Error(
-				"failed to determine diff, trying again later",
-				"error", err)
-			continue
-		}
+	var coordinates []PlacementCoordinates
+	if err := activityExec.Get(ctx, &coordinates); err != nil {
+		return err
+	}
 
-		if !isDiff {
-			logger.Info("no diff detected, will check again later")
-			continue
-		}
+	artifactsByName := map[string]v1alpha1.Artifact{}
+	for _, a := range applicationConfig.Spec.Artifacts {
+		artifactsByName[a.Name] = a
+	}
 
-		doCheckReq := DoCheckRequest{
-			Name:            applicationConfig.Name,
-			Namespace:       targetNamespace,
-			Constraints:     environment.Constraints,
-			TargetArtifacts: filteredArtifacts,
+	var filteredArtifacts []v1alpha1.Artifact
+	for _, required := range environment.RequiredArtifacts {
+		if a, ok := artifactsByName[required]; ok {
+			filteredArtifacts = append(filteredArtifacts, a)
 		}
-		childWorkflowCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+	}
+
+	var reconcileFutures []workflow.Future
+	for _, placement := range coordinates {
+		childWfOptions := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
 			ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
 		})
-		var checked bool
-		if err := workflow.ExecuteChildWorkflow(childWorkflowCtx, w.DoCheck, doCheckReq).Get(ctx, &checked); err != nil {
-			logger.Error("unable to check for promotion, trying again later", "error", err)
-			continue
-		}
-
-		if !checked {
-			logger.Info("some checks are not ready, cannot promote artifact.")
-			continue
-		}
-
-		dpr := DoPushRequest{
+		reconcileRequest := ReconcilePlacementRequest{
 			Name:            applicationConfig.Name,
-			Namespace:       targetNamespace,
+			Coordinates:     placement,
 			TargetArtifacts: filteredArtifacts,
-		}
-		var success bool
-		if err := workflow.ExecuteActivity(activityContext, w.DoPush, dpr).Get(ctx, &success); err != nil {
-			logger.Error("failed to reconcile environment, trying again later", "error", err)
-			continue
-		}
-		if success {
-			logger.Info("updated environment")
+			Constraints:     environment.Constraints,
+			EnvironmentName: environment.Name,
 		}
 
-		updateReq := UpdateDeployedVersionsRequest{
-			Name:              applicationConfig.Name,
-			Namespace:         applicationConfig.Namespace,
-			Environment:       req.TargetEnvironment,
-			DeployedArtifacts: filteredArtifacts,
-		}
+		reconcileFutures = append(reconcileFutures, workflow.ExecuteChildWorkflow(childWfOptions, w.ReconcilePlacement, reconcileRequest))
+	}
 
-		if err := workflow.ExecuteActivity(activityContext, w.UpdateDeployedVersions, updateReq); err != nil {
-			logger.Error("failed to update deployed versions", "error", err)
+	selector := workflow.NewSelector(ctx)
+	collectedFutures := 0
+	var reconcileErrs []error
+	for _, f := range reconcileFutures {
+		selector.AddFuture(f, func(f workflow.Future) {
+			collectedFutures += 1
+			if err := f.Get(ctx, nil); err != nil {
+				reconcileErrs = append(reconcileErrs, err)
+			}
+		})
+	}
+
+	for collectedFutures < len(reconcileFutures) {
+		selector.Select(ctx)
+	}
+
+	if len(reconcileErrs) > 0 {
+		for _, e := range reconcileErrs {
+			logger.Info("could not reconcile placement", "error", e)
 		}
+		return fmt.Errorf("failed to reconcile environment %s", environment.Name)
+	}
+
+	updateReq := UpdateDeployedVersionsRequest{
+		Name:              applicationConfig.Name,
+		Namespace:         applicationConfig.Namespace,
+		Environment:       environment.Name,
+		DeployedArtifacts: filteredArtifacts,
+	}
+
+	if err := workflow.ExecuteActivity(activityContext, w.UpdateDeployedVersions, updateReq).Get(ctx, nil); err != nil {
+		logger.Error("failed to update deployed versions", "error", err)
+	}
+
+	return nil
+}
+
+type ReconcilePlacementRequest struct {
+	Name            string
+	ConfigNamespace string
+	Coordinates     PlacementCoordinates
+	TargetArtifacts []v1alpha1.Artifact
+	Constraints     []v1alpha1.Constraint
+	EnvironmentName string
+}
+
+func (w *Worker) ReconcilePlacement(ctx workflow.Context, req ReconcilePlacementRequest) error {
+	logger := workflow.GetLogger(ctx)
+	activityContext := workflow.WithActivityOptions(ctx, defaultActivityOptions)
+
+	ddr := DoDiffRequest{
+		Name:            req.Name,
+		Coordinates:     req.Coordinates,
+		TargetArtifacts: req.TargetArtifacts,
+	}
+
+	var isDiff bool
+	if err := workflow.ExecuteActivity(activityContext, w.DoDiff, ddr).Get(ctx, &isDiff); err != nil {
+		logger.Error(
+			"failed to determine diff, trying again later",
+			"error", err)
+		return err
+	}
+
+	if !isDiff {
+		logger.Info("no diff detected, will check again later")
+		return nil
+	}
+
+	doCheckReq := DoCheckRequest{
+		Name:            req.Name,
+		Coordinates:     req.Coordinates,
+		Constraints:     req.Constraints,
+		TargetArtifacts: req.TargetArtifacts,
+	}
+	childWorkflowCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+		ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
+	})
+	var checked bool
+	if err := workflow.ExecuteChildWorkflow(childWorkflowCtx, w.DoCheck, doCheckReq).Get(ctx, &checked); err != nil {
+		logger.Error("unable to check for promotion, trying again later", "error", err)
+		return err
+	}
+
+	if !checked {
+		logger.Info("some checks are not ready, cannot promote artifact.")
+		return nil
+	}
+
+	dpr := DoPushRequest{
+		Name:            req.Name,
+		Coordinates:     req.Coordinates,
+		TargetArtifacts: req.TargetArtifacts,
+	}
+	var success bool
+	if err := workflow.ExecuteActivity(activityContext, w.DoPush, dpr).Get(ctx, &success); err != nil {
+		logger.Error("failed to reconcile environment, trying again later", "error", err)
+		return err
+	}
+	if success {
+		logger.Info("updated environment")
 	}
 
 	return nil
@@ -291,13 +376,13 @@ func (w *Worker) EnvironmentReconciler(ctx workflow.Context, req EnvironmentReco
 
 type DoDiffRequest struct {
 	Name            string
-	Namespace       string
+	Coordinates     PlacementCoordinates
 	TargetArtifacts []v1alpha1.Artifact
 }
 
 func (w *Worker) DoDiff(ctx context.Context, req DoDiffRequest) (bool, error) {
-	rcg, _ := w.RestClientGetterFactory(req.Namespace)
-	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, req.TargetArtifacts)
+	rcg, _ := w.RestClientGetterFactory(req.Coordinates.Cluster, req.Coordinates.Namespace)
+	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Coordinates.Namespace, req.TargetArtifacts)
 	if err != nil {
 		return false, err
 	}
@@ -305,7 +390,8 @@ func (w *Worker) DoDiff(ctx context.Context, req DoDiffRequest) (bool, error) {
 }
 
 type DoCheckRequest struct {
-	Name, Namespace string
+	Name            string
+	Coordinates     PlacementCoordinates
 	Constraints     []v1alpha1.Constraint
 	TargetArtifacts []v1alpha1.Artifact
 }
@@ -324,9 +410,9 @@ func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error)
 	for _, c := range req.Constraints {
 		switch c.Kind {
 		case "DependsOn":
-			statelessFutures = append(statelessFutures, w.newDependsOnFutureProvider(req, *c.DependsOn))
+			statelessFutures = append(statelessFutures, w.newDependsOnFutureProvider(req, *c.DependsOn, req.Coordinates))
 		case "HelmCanary":
-			statefulFutures = append(statefulFutures, w.newHelmCanaryFutureProvider(req, *c.HelmCanary))
+			statefulFutures = append(statefulFutures, w.newHelmCanaryFutureProvider(req, *c.HelmCanary, req.Coordinates))
 		}
 	}
 
@@ -347,7 +433,7 @@ func (w *Worker) DoCheck(ctx workflow.Context, req DoCheckRequest) (bool, error)
 	return canContinue, nil
 }
 
-func (w *Worker) newDependsOnFutureProvider(req DoCheckRequest, dependsOn v1alpha1.DependsOnConstraint) futureProvider {
+func (w *Worker) newDependsOnFutureProvider(req DoCheckRequest, dependsOn v1alpha1.DependsOnConstraint, coordinates PlacementCoordinates) futureProvider {
 	return func(ctx workflow.Context) workflow.Future {
 		activityContext := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 			ScheduleToCloseTimeout: 1 * time.Minute,
@@ -357,7 +443,7 @@ func (w *Worker) newDependsOnFutureProvider(req DoCheckRequest, dependsOn v1alph
 		})
 		req := DependsOnConstraintRequest{
 			Name:            req.Name,
-			Namespace:       req.Namespace,
+			Namespace:       coordinates.Namespace,
 			TargetArtifacts: req.TargetArtifacts,
 			EnvironmentName: dependsOn.EnvironmentName,
 			Artifacts:       dependsOn.Artifacts,
@@ -366,14 +452,14 @@ func (w *Worker) newDependsOnFutureProvider(req DoCheckRequest, dependsOn v1alph
 	}
 }
 
-func (w *Worker) newHelmCanaryFutureProvider(req DoCheckRequest, canaryConfig v1alpha1.HelmCanaryConstraint) futureProvider {
+func (w *Worker) newHelmCanaryFutureProvider(req DoCheckRequest, canaryConfig v1alpha1.HelmCanaryConstraint, coordinates PlacementCoordinates) futureProvider {
 	return func(ctx workflow.Context) workflow.Future {
 		childContext := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
 			ParentClosePolicy: enums.PARENT_CLOSE_POLICY_TERMINATE,
 		})
 		req := HelmCanaryRequest{
 			Name:             req.Name,
-			Namespace:        req.Namespace,
+			Coordinates:      coordinates,
 			TargetArtifacts:  req.TargetArtifacts,
 			CanaryConstraint: canaryConfig,
 		}
@@ -475,7 +561,7 @@ func (w *Worker) DependsOnConstraint(ctx context.Context, req DependsOnConstrain
 
 type HelmCanaryRequest struct {
 	Name             string
-	Namespace        string
+	Coordinates      PlacementCoordinates
 	TargetArtifacts  []v1alpha1.Artifact
 	CanaryConstraint v1alpha1.HelmCanaryConstraint
 }
@@ -500,7 +586,7 @@ func (w *Worker) HelmCanaryConstraint(ctx workflow.Context, req HelmCanaryReques
 
 	pushReq := DoPushRequest{
 		Name:            name,
-		Namespace:       req.Namespace,
+		Coordinates:     req.Coordinates,
 		TargetArtifacts: artifacts,
 	}
 
@@ -516,30 +602,17 @@ func (w *Worker) HelmCanaryConstraint(ctx workflow.Context, req HelmCanaryReques
 
 type DoPushRequest struct {
 	Name            string
-	Namespace       string
+	Coordinates     PlacementCoordinates
 	TargetArtifacts []v1alpha1.Artifact
 }
 
 func (w *Worker) DoPush(ctx context.Context, req DoPushRequest) error {
-	rcg, _ := w.RestClientGetterFactory(req.Namespace)
-	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, req.TargetArtifacts)
+	rcg, _ := w.RestClientGetterFactory(req.Coordinates.Cluster, req.Coordinates.Namespace)
+	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Coordinates.Namespace, req.TargetArtifacts)
 	if err != nil {
 		return err
 	}
 	return hr.Push(ctx)
-}
-
-type DoDeleteRequest struct {
-	Name, Namespace string
-}
-
-func (w *Worker) DoDelete(ctx context.Context, req DoDeleteRequest) error {
-	rcg, _ := w.RestClientGetterFactory(req.Namespace)
-	hr, err := NewHelmReconciler(ctx, rcg, req.Name, req.Namespace, nil)
-	if err != nil {
-		return err
-	}
-	return hr.doDelete(ctx, req.Namespace)
 }
 
 type UpdateDeployedVersionsRequest struct {
@@ -583,4 +656,52 @@ func determinePlacement(parentNamespace string, placement *v1alpha1.Placement) s
 		namespace = placement.StaticPlacement.Namespace
 	}
 	return namespace
+}
+
+type PlacementCoordinates struct {
+	Cluster   string
+	Namespace string
+}
+
+type PlacementData struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
+}
+
+func (w *Worker) DeterminePlacement(parentNamespace string, placement v1alpha1.Placement) ([]PlacementCoordinates, error) {
+	if static := placement.StaticPlacement; static != nil {
+		return []PlacementCoordinates{
+			{Cluster: static.Cluster, Namespace: static.Namespace},
+		}, nil
+	}
+
+	f, err := os.Open("clusters.json")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var data []PlacementData
+	if err := json.NewDecoder(f).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	placementRequirements := labels.Requirements{}
+	for k, v := range placement.DynamicPlacement.Selector {
+		labelReq, _ := labels.NewRequirement(k, selection.Equals, []string{v})
+		placementRequirements = append(placementRequirements, *labelReq)
+	}
+	selector := labels.NewSelector().Add(placementRequirements...)
+	var coordinates []PlacementCoordinates
+	for _, cluster := range data {
+		if selector.Matches(labels.Set(cluster.Labels)) {
+			coordinates = append(coordinates, PlacementCoordinates{
+				Cluster:   cluster.Name,
+				Namespace: parentNamespace,
+			})
+		}
+	}
+
+	return coordinates, nil
+
 }

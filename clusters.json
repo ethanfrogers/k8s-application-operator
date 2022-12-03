@@ -1,0 +1,20 @@
+[
+  {
+    "name":  "prod1",
+    "labels": {
+      "env": "prod"
+    }
+  },
+  {
+    "name": "prod2",
+    "labels": {
+      "env": "prod"
+    }
+  },
+  {
+    "name": "staging1",
+    "labels": {
+      "env": "staging"
+    }
+  }
+]

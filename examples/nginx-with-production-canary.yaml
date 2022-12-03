@@ -33,14 +33,13 @@ spec:
           cluster: staging1
           namespace: nginx-staging
     - name: production
+      requiredArtifacts: ["chart", "common", "valuesProd"]
       placement:
         dynamicPlacement:
           selector:
             env: prod
-      requiredArtifacts:
-        - chart
-        - common
-        - valuesProd
+      # constraints defines a set of gates that have to succeed before
+      # this environment can be deployed to
       constraints:
         # DependsOn specifies that it's artifacts must have been applied
         # in a lower priotity environment
@@ -50,12 +49,8 @@ spec:
             artifacts:
               - chart
               - common
-        # Before a deployment can happen in this environment
-        # a canary must be deployed. Eventually, we will
-        # run post-deployment verification before calling
-        # this constraint successful
         - kind: HelmCanary
           helmCanary:
-            ttl: 2m
+            ttl: 1m
             values:
               replicaCount: 1

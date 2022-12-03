@@ -8,7 +8,7 @@ spec:
     - kind: HelmChart
       name: chart
       repository: https://charts.bitnami.com/bitnami/nginx
-      version: 13.2.13
+      version: 13.2.12
     - kind: HelmValues
       name: common
       values:
@@ -30,9 +30,14 @@ spec:
         # staticPlacement defines an explicit namespace
         # that this should be deployed in
         staticPlacement:
+          cluster: staging1
           namespace: nginx-staging
     - name: production
       requiredArtifacts: ["chart", "common", "valuesProd"]
+      placement:
+        dynamicPlacement:
+          selector:
+            env: prod
       # constraints defines a set of gates that have to succeed before
       # this environment can be deployed to
       constraints:
@@ -44,12 +49,3 @@ spec:
             artifacts:
               - chart
               - common
-        # Before a deployment can happen in this environment
-        # a canary must be deployed. Eventually, we will
-        # run post-deployment verification before calling
-        # this constraint successful
-        - kind: HelmCanary
-          helmCanary:
-            ttl: 1m
-            values:
-              replicaCount: 1

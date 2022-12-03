@@ -1,8 +1,8 @@
 package main
 
 import (
-	"flag"
 	"fmt"
+	flag "github.com/spf13/pflag"
 	"os"
 	"path/filepath"
 
@@ -25,6 +25,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+var (
+	contextMap map[string]string
+)
+
 func main() {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -33,7 +37,7 @@ func main() {
 	workflowTaskQueue := flag.String("workflow-task-queue", "application-reconciler", "")
 	temporalHost := flag.String("temporal-host", "localhost:7233", "")
 	kubeconfig := flag.String("kubeconfig", "", "")
-	kubeContext := flag.String("context", "microk8s", "")
+	flag.StringToStringVarP(&contextMap, "map-cluster-ctx", "m", map[string]string{}, "")
 	flag.Parse()
 
 	logger, err := zap.NewDevelopment()
@@ -65,13 +69,21 @@ func main() {
 		panic(err)
 	}
 
+	for k, v := range contextMap {
+		fmt.Printf("cluster %s mapped to context %s\n", k, v)
+	}
+
 	w := &worker.Worker{
 		Client: crclient,
-		RestClientGetterFactory: func(namespace string) (genericclioptions.RESTClientGetter, error) {
+		RestClientGetterFactory: func(cluster, namespace string) (genericclioptions.RESTClientGetter, error) {
+			clusterContext, ok := contextMap[cluster]
+			if !ok {
+				return nil, fmt.Errorf("no cluster found for %s", cluster)
+			}
 			return &genericclioptions.ConfigFlags{
 				KubeConfig: kubeconfig,
 				Namespace:  &namespace,
-				Context:    pointer.String(*kubeContext),
+				Context:    pointer.String(clusterContext),
 			}, nil
 		},
 	}

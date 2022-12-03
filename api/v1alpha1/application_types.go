@@ -51,11 +51,17 @@ type HelmCanaryConstraint struct {
 }
 
 type StaticPlacement struct {
+	Cluster   string `json:"cluster"`
 	Namespace string `json:"namespace"`
 }
 
+type DynamicPlacement struct {
+	Selector map[string]string `json:"selector"`
+}
+
 type Placement struct {
-	StaticPlacement *StaticPlacement `json:"staticPlacement,omitempty"`
+	StaticPlacement  *StaticPlacement  `json:"staticPlacement,omitempty"`
+	DynamicPlacement *DynamicPlacement `json:"dynamicPlacement,omitempty"`
 }
 
 type Verify struct {

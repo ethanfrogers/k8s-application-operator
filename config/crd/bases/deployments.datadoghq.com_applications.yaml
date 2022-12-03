@@ -107,11 +107,23 @@ spec:
                       type: string
                     placement:
                       properties:
+                        dynamicPlacement:
+                          properties:
+                            selector:
+                              additionalProperties:
+                                type: string
+                              type: object
+                          required:
+                          - selector
+                          type: object
                         staticPlacement:
                           properties:
+                            cluster:
+                              type: string
                             namespace:
                               type: string
                           required:
+                          - cluster
                           - namespace
                           type: object
                       type: object

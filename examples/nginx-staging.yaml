@@ -1,0 +1,30 @@
+apiVersion: deployments.datadoghq.com/v1alpha1
+kind: Application
+metadata:
+  name: nginx
+  namespace: nginx
+spec:
+  artifacts:
+    - kind: HelmChart
+      name: chart
+      repository: https://charts.bitnami.com/bitnami/nginx
+      version: 13.2.13
+    - kind: HelmValues
+      name: common
+      values:
+        image.tag: 1.22.1
+    - kind: HelmValues
+      name: valuesStaging
+      values:
+        replicaCount: 1
+  environments:
+    - name: staging
+      # requiredArtifacts are all the artifacts that should
+      # be deployed to this environment
+      requiredArtifacts: ["chart", "common", "valuesStaging"]
+      placement:
+        # staticPlacement defines an explicit namespace
+        # that this should be deployed in
+        staticPlacement:
+          cluster: staging1
+          namespace: nginx-staging
